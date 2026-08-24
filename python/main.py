@@ -10,7 +10,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-# --- HARDCODED CONFIG --------------------------------------------------------
+# --- HARDCODED CONFIG -------------------------------------------------------
 HANDLES = ["UooU672514", "i9yl9"]
 INTERVAL_SECONDS = 10
 BARK_KEY = "aAQmJDszVrdbc9braKD8am"
