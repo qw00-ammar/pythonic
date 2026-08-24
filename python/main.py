@@ -1,45 +1,51 @@
+import itertools
 import json
 import os
 import threading
 import time
 from datetime import datetime
+from urllib.parse import quote
 
 import requests
 from flask import Flask, jsonify
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 
-# --- HARDCODED CONFIG -------------------------------------------------------
+# --- HARDCODED CONFIG --------------------------------------------------------
 HANDLES = ["UooU672514", "i9yl9"]
-INTERVAL_SECONDS = 10
+INTERVAL_SECONDS = 8
 BARK_KEY = "aAQmJDszVrdbc9braKD8am"
 BARK_SERVER = "https://api.day.app"
 NTFY_TOPIC = "JamilaActivatedHerXAccount"
 NTFY_HEALTH_INTERVAL_SECONDS = 60*60
 
 BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
-TIMEOUT = 10
+PROXY_USERNAME = "c6gwek0u-y8pgnsw"
+PROXY_PASSWORD = "m8ytsw4bqg"
+TIMEOUT = 6
 
 X_API_HOSTS = ("api.x.com", "api.twitter.com")
+PROXIES = [
+    ("Netherlands/Amsterdam", "nl-025.totallyacdn.com", 443),
+    ("Germany/Frankfurt", "de-037.totallyacdn.com", 443),
+    ("Netherlands/Amsterdam", "nl-024.totallyacdn.com", 443),
+    ("Netherlands/Amsterdam", "nl-046.totallyacdn.com", 443),
+    ("United Kingdom/London", "uk-050.totallyacdn.com", 443),
+    ("Germany/Frankfurt", "de-038.totallyacdn.com", 443),
+    ("France/Paris", "fr-033.totallyacdn.com", 443),
+    ("Germany/Frankfurt", "de-036.totallyacdn.com", 443),
+    ("Netherlands/Amsterdam", "nl-047.totallyacdn.com", 443),
+    ("United Kingdom/London", "uk-040.totallyacdn.com", 443),
+    ("Romania", "ro-019.totallyacdn.com", 443), 
+    ("Romania", "ro-017.totallyacdn.com", 443),
+    
+]
 # ----------------------------------------------------------------------------
 
 
 app = Flask(__name__)
+proxy_cycle = itertools.cycle(PROXIES)
 watcher_lock = threading.Lock()
 watcher_started = False
-
-session = requests.Session()
-_retry = Retry(
-    total=2,
-    connect=2,
-    read=2,
-    backoff_factor=0.5,
-    status_forcelist=(500, 502, 503, 504),
-    allowed_methods=frozenset(["GET", "POST"]),
-)
-session.mount("https://", HTTPAdapter(max_retries=_retry))
-session.mount("http://", HTTPAdapter(max_retries=_retry))
 
 
 def default_account_state():
@@ -47,9 +53,9 @@ def default_account_state():
         "last_state": None,
         "last_status": None,
         "last_api_host": None,
+        "last_proxy": None,
         "last_error": None,
         "last_error_signature": None,
-        "error_since": None,
         "healthy_since": None,
     }
 
@@ -61,13 +67,12 @@ state = {
     "last_check_at": None,
     "last_log": None,
     "next_health_at": None,
-    "last_loop_error_signature": None,
     "accounts": {handle: default_account_state() for handle in HANDLES},
 }
 
 
 def now_text():
-    return datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def log(message):
@@ -78,6 +83,18 @@ def log(message):
 
 def profile_url(handle):
     return f"https://x.com/{handle}"
+
+
+def proxy_dict(hostname, port):
+    username = quote(PROXY_USERNAME, safe="")
+    password = quote(PROXY_PASSWORD, safe="")
+    proxy_url = f"https://{username}:{password}@{hostname}:{port}"
+    return {"http": proxy_url, "https": proxy_url}
+
+
+def proxy_label(proxy):
+    location, hostname, port = proxy
+    return f"{location} ({hostname}:{port})"
 
 
 def format_x_errors(errors):
@@ -92,11 +109,12 @@ def format_x_errors(errors):
     return "; ".join(parts) if parts else "error"
 
 
-def get_guest_token():
+def get_guest_token(proxy):
+    _, hostname, port = proxy
     errors = []
 
     for api_host in X_API_HOSTS:
-        response = session.post(
+        response = requests.post(
             f"https://{api_host}/1.1/guest/activate.json",
             headers={
                 "Authorization": f"Bearer {BEARER}",
@@ -105,6 +123,7 @@ def get_guest_token():
                 "Origin": "https://x.com",
                 "Referer": "https://x.com/",
             },
+            proxies=proxy_dict(hostname, port),
             timeout=TIMEOUT,
         )
 
@@ -121,7 +140,8 @@ def get_guest_token():
     raise RuntimeError("guest token failed (" + "; ".join(errors) + ")")
 
 
-def query_user(handle, token, api_host):
+def query_user(handle, token, proxy, api_host):
+    _, hostname, port = proxy
     variables = {
         "screen_name": handle,
         "withGrokTranslatedBio": True,
@@ -132,7 +152,7 @@ def query_user(handle, token, api_host):
     }
     url = f"https://{api_host}/graphql/IGgvgiOx4QZndDHuD3x9TQ/UserByScreenName"
 
-    response = session.get(
+    response = requests.get(
         url,
         params={
             "variables": json.dumps(variables, separators=(",", ":")),
@@ -148,6 +168,7 @@ def query_user(handle, token, api_host):
             "Origin": "https://x.com",
             "Referer": "https://x.com/",
         },
+        proxies=proxy_dict(hostname, port),
         timeout=TIMEOUT,
     )
 
@@ -168,12 +189,16 @@ def query_user(handle, token, api_host):
 
 
 def check_x_account(handle, acc):
+    proxy = next(proxy_cycle)
+    acc["last_proxy"] = proxy_label(proxy)
     try:
-        token, api_host = get_guest_token()
-        status = query_user(handle, token, api_host)
+        token, api_host = get_guest_token(proxy)
+        status = query_user(handle, token, proxy, api_host)
         return status, api_host
+    except requests.exceptions.Timeout as err:
+        raise RuntimeError(f"proxy timeout via {acc['last_proxy']}: {err}") from err
     except requests.exceptions.RequestException as err:
-        raise RuntimeError(f"X/Twitter API unreachable: {err}") from err
+        raise RuntimeError(f"proxy request failed via {acc['last_proxy']}: {err}") from err
 
 
 def status_state(status):
@@ -195,11 +220,12 @@ def status_state(status):
 
 
 def send_bark(title, message, url):
-    response = session.post(
+    response = requests.post(
         f"{BARK_SERVER}/{BARK_KEY}",
         json={
             "title": title,
             "body": message,
+            "url": url,
             "sound": "chime",
             "level": "critical",
             "Icon": "https://pbs.twimg.com/profile_images/2071530886810771456/gwvAIXM2_400x400.jpg",
@@ -213,33 +239,24 @@ def send_bark(title, message, url):
         raise RuntimeError(f"Bark error: {data.get('message')}")
 
 
-NTFY_PRIORITY_MAP = {"min": 1, "low": 2, "default": 3, "high": 4, "urgent": 5}
-
-
-def send_ntfy(title, message, click_url="", tags="information_source", priority="default"):
-    # Published via ntfy's JSON API (UTF-8 body) rather than HTTP headers.
-    # Headers are Latin-1 only, so an emoji title would break the old
-    # header-based approach with a UnicodeEncodeError.
-    payload = {
-        "topic": NTFY_TOPIC,
-        "title": title,
-        "message": message,
-        "priority": NTFY_PRIORITY_MAP.get(priority, 3),
+def send_ntfy(title, message, click_url="", tags="tada,fire,bird", priority="default"):
+    headers = {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Title": title,
+        "Tags": tags,
+        "Priority": priority,
     }
-    if tags:
-        payload["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
-    if click_url:
-        payload["click"] = click_url
 
-    response = session.post(
-        "https://ntfy.sh/",
-        json=payload,
+    response = requests.post(
+        f"https://ntfy.sh/{NTFY_TOPIC}",
+        data=message.encode("utf-8"),
+        headers=headers,
         timeout=TIMEOUT,
     )
     response.raise_for_status()
 
 
-def send_ntfy_safe(title, message, click_url="", tags="information_source", priority="default"):
+def send_ntfy_safe(title, message, click_url="", tags="tada,fire,bird", priority="default"):
     try:
         send_ntfy(title, message, click_url, tags, priority)
     except Exception as err:
@@ -255,25 +272,23 @@ def send_bark_safe(title, message, url):
 
 def notify_startup(started_at):
     send_ntfy_safe(
-        "🚀 X Watcher started",
+        f"Watcher started: {', '.join('@' + h for h in HANDLES)}",
         (
-            "Status: Online\n"
-            f"Started at: {started_at}\n"
-            f"Monitored accounts: [{' - '.join('@' + h for h in HANDLES)}]\n"
-            f"Check X every: {INTERVAL_SECONDS}s\n"
-            f"Health report interval: {int(NTFY_HEALTH_INTERVAL_SECONDS / 60)} min"
+            f"Diploi started at {started_at}.\n"
+            f"Checking Twitter api every {INTERVAL_SECONDS}s\n"
+            f"Watching: {', '.join('@' + h for h in HANDLES)}\n"
+            "Twitter API health notification every 20 minutes."
         ),
         profile_url(HANDLES[0]),
-        tags="information_source",
-        priority="default",
+        tags="rocket,bell",
+        priority="high",
     )
 
 
 def notify_health():
-    any_error = any(acc["last_error_signature"] for acc in state["accounts"].values())
-
     lines = [
-        f"Overall status: {'DEGRADED' if any_error else 'OK'}",
+        "Everything is OK. No current errors.",
+        "Still working and X/Twitter API responded successfully.",
         "",
         f"Time: {now_text()}",
         f"Checks completed: {state['check_count']}",
@@ -282,106 +297,76 @@ def notify_health():
     for handle in HANDLES:
         acc = state["accounts"][handle]
         watching_for = "deactivation" if acc["last_state"] == "active" else "activation"
-        status_line = (
-            f"  Status: ERROR since {acc['error_since']} ({acc['last_error_signature']})"
-            if acc["last_error_signature"] else "  Status: OK"
-        )
         lines.append(
             "\n"
             f"@{handle}\n"
-            f"{status_line}\n"
             f"  Current: {acc['last_state']}\n"
             f"  Watching for: {watching_for}\n"
             f"  Last response: {acc['last_status']}\n"
             f"  Healthy since: {acc['healthy_since']}\n"
+            f"  API host: {acc['last_api_host']}\n"
+            f"  Last proxy: {acc['last_proxy']}"
         )
 
     send_ntfy_safe(
-        f"{'⚠️' if any_error else '✅'} X Watcher Status: {'DEGRADED' if any_error else 'OK'}",
+        f"Watcher OK: {', '.join('@' + h for h in HANDLES)}",
         "\n".join(lines),
         profile_url(HANDLES[0]),
-        tags=("warning" if any_error else "white_check_mark"),
-        priority=("high" if any_error else "default"),
+        tags="white_check_mark,bell",
+        priority="default",
     )
 
 
 def notify_error(handle, error_text):
     send_ntfy_safe(
-        f"⚠️ X Watcher ERROR",
+        f"Watcher ERROR: @{handle}",
         (
-            "Severity: Error\n"
-            f"Account: @{handle}\n"
+            "Error detected immediately sent.\n\n"
             f"Time: {now_text()}\n"
-            f"Check #: {state['check_count']}\n"
-            f"Details: {error_text}"
+            f"Check: #{state['check_count']}\n"
+            f"Error: {error_text}"
         ),
         profile_url(handle),
-        tags="rotating_light",
+        tags="warning,rotating_light",
         priority="urgent",
-    )
-
-
-def notify_recovered(handle, error_since, last_error_signature):
-    send_ntfy_safe(
-        f"🟢 X Watcher RECOVERED",
-        (
-            "Severity: Recovered\n"
-            f"Account: @{handle}\n"
-            f"Down since: {error_since}\n"
-            f"Recovered at: {now_text()}\n"
-            f"Last error: {last_error_signature}"
-        ),
-        profile_url(handle),
-        tags="white_check_mark",
-        priority="default",
     )
 
 
 def notify_activated(handle, detected_at):
     url = profile_url(handle)
-    title = f"😎😎 @{handle} ONLINE"
-    message = (
-        f"Account: : @{handle}\n"
-        "Event: Account activated\n"
-        f"URL: {url}\n"
-        f"Detected at: {detected_at}"
+    title = f"@{handle} "
+    message = f"Online!!\n\n{url}\n\nDetected at: {detected_at}"
+    send_ntfy_safe(title, message, url, tags="tada,fire,bird", priority="urgent")
+    send_bark_safe(
+        f"@{handle}",
+        f"\n😎😎 Online!!\n\n{url}\n\nDetected at: {detected_at}",
+        url,
     )
-    send_ntfy_safe(title, message, url, tags="white_check_mark", priority="urgent")
-    send_bark_safe(title, message, url)
 
 
 def notify_deactivated(handle, status, detected_at):
     url = profile_url(handle)
-    title = f"❌❌ @{handle} OFFLINE"
+    title = f"@{handle} "
     message = (
-        f"Account: @{handle}\n"
-        "Event: Account deactivated\n"
+        "❌❌ Offline!!\n\n"
         f"Response: {status}\n"
         f"Detected at: {detected_at}"
     )
-    send_ntfy_safe(title, message, url, tags="rotating_light", priority="urgent")
-    send_bark_safe(title, message, url)
-
-
-def enter_error_state(handle, acc, signature):
-    if signature != acc["last_error_signature"]:
-        notify_error(handle, signature)
-        acc["last_error_signature"] = signature
-        if acc["error_since"] is None:
-            acc["error_since"] = now_text()
-        acc["healthy_since"] = None
-        state["next_health_at"] = time.monotonic() + NTFY_HEALTH_INTERVAL_SECONDS
-
-
-def leave_error_state(handle, acc):
-    if acc["last_error_signature"] is not None:
-        notify_recovered(handle, acc["error_since"], acc["last_error_signature"])
-    acc["last_error_signature"] = None
-    acc["error_since"] = None
+    send_ntfy_safe(title, message, url, tags="warning,bell", priority="urgent")
+    send_bark_safe(
+        f"@{handle}",
+        f"\n❌❌ Offline!!\n\nResponse: {status}\nDetected at: {detected_at}",
+        url,
+    )
 
 
 def handle_error(handle, acc, error_text):
-    enter_error_state(handle, acc, error_text)
+    signature = f"Exception: {error_text}"
+    if signature != acc["last_error_signature"]:
+        notify_error(handle, signature)
+        acc["last_error_signature"] = signature
+        acc["healthy_since"] = None
+        state["next_health_at"] = time.monotonic() + NTFY_HEALTH_INTERVAL_SECONDS
     acc["last_error"] = error_text
     log(f"[{handle}] Error: {error_text}")
 
@@ -398,15 +383,18 @@ def check_one_handle(handle):
 
         if current_state == "unknown":
             signature = f"X/Twitter API returned: {status}"
-            enter_error_state(handle, acc, signature)
+            if signature != acc["last_error_signature"]:
+                notify_error(handle, signature)
+                acc["last_error_signature"] = signature
+                acc["healthy_since"] = None
+                state["next_health_at"] = time.monotonic() + NTFY_HEALTH_INTERVAL_SECONDS
             log(f"[{handle}] Unknown API response: {status}")
             return
 
-        was_error = acc["last_error_signature"] is not None
-        leave_error_state(handle, acc)
-        if was_error or acc["healthy_since"] is None:
+        if acc["last_error_signature"] is not None or acc["healthy_since"] is None:
             acc["healthy_since"] = now_text()
             state["next_health_at"] = time.monotonic() + NTFY_HEALTH_INTERVAL_SECONDS
+        acc["last_error_signature"] = None
 
         if acc["last_state"] is None:
             acc["last_state"] = current_state
@@ -425,55 +413,27 @@ def check_one_handle(handle):
 
 
 def watcher_loop():
-    try:
-        state["running"] = True
-        state["started_at"] = now_text()
-        state["next_health_at"] = time.monotonic() + NTFY_HEALTH_INTERVAL_SECONDS
+    state["running"] = True
+    state["started_at"] = now_text()
+    state["next_health_at"] = time.monotonic() + NTFY_HEALTH_INTERVAL_SECONDS
+    for handle in HANDLES:
+        acc = state["accounts"][handle]
+        acc["healthy_since"] = state["started_at"]
+    notify_startup(state["started_at"])
+    log("Watcher loop started.")
+
+    while True:
+        state["check_count"] += 1
+        state["last_check_at"] = now_text()
+
         for handle in HANDLES:
-            acc = state["accounts"][handle]
-            acc["healthy_since"] = state["started_at"]
-        notify_startup(state["started_at"])
-        log("Watcher loop started.")
+            check_one_handle(handle)
 
-        while True:
-            try:
-                state["check_count"] += 1
-                state["last_check_at"] = now_text()
+        if state["next_health_at"] is not None and time.monotonic() >= state["next_health_at"]:
+            notify_health()
+            state["next_health_at"] = time.monotonic() + NTFY_HEALTH_INTERVAL_SECONDS
 
-                for handle in HANDLES:
-                    check_one_handle(handle)
-
-                if state["next_health_at"] is not None and time.monotonic() >= state["next_health_at"]:
-                    notify_health()
-                    state["next_health_at"] = time.monotonic() + NTFY_HEALTH_INTERVAL_SECONDS
-            except Exception as err:
-                # check_one_handle already guards per-account errors; this is a
-                # last-resort net so a bug here can never silently kill the thread.
-                signature = f"loop crash: {err}"
-                if signature != state["last_loop_error_signature"]:
-                    send_ntfy_safe(
-                        "🛑 X Watcher CRITICAL: Internal error",
-                        (
-                            "Severity: Critical\n"
-                            "Component: Watcher loop\n"
-                            f"Time: {now_text()}\n"
-                            f"Details: {err}\n"
-                            f"Recovery: Retrying every {INTERVAL_SECONDS}s"
-                        ),
-                        profile_url(HANDLES[0]),
-                        tags="rotating_light",
-                        priority="urgent",
-                    )
-                    state["last_loop_error_signature"] = signature
-                log(f"Watcher loop crash: {err}")
-            else:
-                state["last_loop_error_signature"] = None
-
-            time.sleep(INTERVAL_SECONDS)
-    finally:
-        # Only reached if something escapes the inner loop entirely.
-        state["running"] = False
-        log("Watcher loop exited unexpectedly.")
+        time.sleep(INTERVAL_SECONDS)
 
 
 def ensure_watcher_started():
@@ -507,22 +467,7 @@ def index():
 def health():
     ensure_watcher_started()
     any_error = any(acc["last_error"] for acc in state["accounts"].values())
-
-    stale = False
-    if state["last_check_at"]:
-        last_dt = datetime.strptime(state["last_check_at"], "%Y-%m-%d %I:%M:%S %p")
-        stale = (datetime.now() - last_dt).total_seconds() > INTERVAL_SECONDS * 6
-
-    ok = state["running"] and not stale
-    return jsonify(
-        {
-            "ok": ok,
-            "running": state["running"],
-            "has_error": any_error,
-            "stale": stale,
-            "last_check_at": state["last_check_at"],
-        }
-    )
+    return jsonify({"ok": True, "running": state["running"], "has_error": any_error})
 
 
 ensure_watcher_started()
